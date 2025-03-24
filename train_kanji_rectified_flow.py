@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from networks.unet import UNet
+from src.data_loader import KanjiDataLoader
 from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
@@ -29,11 +30,12 @@ parser.add_argument("--dataset", type=str, default="Kanji", help="dataset")
 parser.add_argument("--train_use_cfg",type=bool,default=False,help="train with cfg")
 parser.add_argument("--dropout_rate",type=float,default=0.1,help="dropout rate")
 parser.add_argument("--cfg_scale",type=int,default=2.0,help="cfg scale")
-parser.add_argument("--l1_norm",type=bool,default=False,help="l1 norm")
+parser.add_argument("--l1_norm",type=bool,default=True,help="l1 norm")
 parser.add_argument("--use_dit",type=bool,default=False,help="use diffusion transformer")
 parser.add_argument("--sampler",type=str,default="uniform",help="sampler. uniform or log sampler")
 parser.add_argument("--seed",type=int,default=-1,help="seed")
 parser.add_argument("--use_tqdm_discordbot",type=bool,default=False ,help="use tqdm discord bot")
+parser.add_argument("--use_label_clip_embedding",type=bool,default=True,help="use label clip embedding")
 
 args = parser.parse_args()
 
@@ -44,105 +46,83 @@ if args.seed != -1:
 else:
     pass
 
-
-class KanjiDataLoader(Dataset):
-    def __init__(self, data_dir, json_path, transform=None):
-        self.data_dir = data_dir
-        self.transform = transform
-        with open(json_path, "r", encoding="utf-8") as f:
-            self.data_dict = json.load(f)
-        self.file_list = list(self.data_dict.keys())
-
-    def __len__(self):
-        return len(self.file_list)
-
-    def __getitem__(self, idx):
-        file_name = self.file_list[idx]
-        image_path = os.path.join(self.data_dir, file_name)
-        image = Image.open(image_path).convert("L")  # RGBに変換
-        label = torch.tensor(self.data_dict[file_name]["label"], dtype=torch.float)
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, label
-
-
 # GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-if args.use_dit:
-    pass
-    # config = Config()
-    # model = DiffusionTransformer(config)
+class My_Unet(nn.Module):
+    def __init__(self, in_channels, embedding_channels=64, time_embed_dim=256, cond_embed_dim=256, depth=4):
+        super(My_Unet, self).__init__()
 
-else:
-    class Unet(nn.Module):
-        def __init__(self, in_channels, embedding_channels=64, time_embed_dim=256, cond_embed_dim=256, depth=4):
-            super(Unet, self).__init__()
+        self.unet = UNet(
+            in_channels=in_channels,
+            embedding_channels=embedding_channels,
+            cond_embed_dim=cond_embed_dim,
+            time_embed_dim=time_embed_dim,
+            depth=depth,
+            kernel_size=[3,3,3,3,3,3,3],
+            layers=[3,3,3,9,3,3,3],
+            num_groups=[32] * (depth * 2 - 1) 
+        )
+    
+    def forward(self, x, t, c):
+        return self.unet(x, t, c)
+    
+class Time_Embed(nn.Module):
+    def __init__(self, time_embed_dim=256):
+        super(Time_Embed, self).__init__()
+        self.time_embed = nn.Linear(1,time_embed_dim)
+        self.reg = nn.ReLU(inplace=False)
+    
+    def forward(self, t):
+        return self.reg(self.time_embed(t))
 
-            self.unet = UNet(
-                in_channels=in_channels,
-                embedding_channels=embedding_channels,
-                cond_embed_dim=cond_embed_dim,
-                time_embed_dim=time_embed_dim,
-                depth=depth,
-                kernel_size=[3,3,3,3,3,3,3],
-                layers=[3,3,3,9,3,3,3],
-                num_groups=[32] * (depth * 2 - 1) 
-            )
-        
-        def forward(self, x, t, c):
-            return self.unet(x, t, c)
-        
-    class Time_Embed(nn.Module):
-        def __init__(self, time_embed_dim=256):
-            super(Time_Embed, self).__init__()
-            self.time_embed = nn.Linear(1,time_embed_dim)
-            self.reg = nn.ReLU(inplace=False)
-        
-        def forward(self, t):
-            return self.reg(self.time_embed(t))
+class Cond_Embed(nn.Module):
+    def __init__(self,label_num=10, cond_embed_dim=256):
+        super(Cond_Embed, self).__init__()
+        self.hidden_layer = nn.Linear(label_num, 1024)
+        self.cond_embed = nn.Linear(1024,cond_embed_dim)
+        # self.normalize = nn.LayerNorm(cond_embed_dim)
+        self.reg = nn.ReLU(inplace=False)
+    
+    def forward(self, c):
+        c = self.hidden_layer(c)
+        c = self.reg(c)
+        out = self.cond_embed(c)
+        # out = self.normalize(out)
+        return out
 
-    class Cond_Embed(nn.Module):
-        def __init__(self,label_num=10, cond_embed_dim=256):
-            super(Cond_Embed, self).__init__()
-            self.cond_embed = nn.Linear(label_num,cond_embed_dim)
-            # self.normalize = nn.LayerNorm(cond_embed_dim)
-            self.reg = nn.ReLU(inplace=False)
-        
-        def forward(self, c):
-            out = self.cond_embed(c)
-            # out = self.normalize(out)
-            return self.reg(out)
+class CombinedModel(nn.Module):
+    def __init__(self, unet, time_embed, cond_embed):
+        super(CombinedModel, self).__init__()
+        self.unet = unet
+        self.time_embed = time_embed
+        self.cond_embed = cond_embed
 
-
-    class CombinedModel(nn.Module):
-        def __init__(self, unet, time_embed, cond_embed):
-            super(CombinedModel, self).__init__()
-            self.unet = unet
-            self.time_embed = time_embed
-            self.cond_embed = cond_embed
-
-        def forward(self, x, t, c):
-            t = self.time_embed(t)
-            c = self.cond_embed(c)
-            return self.unet(x, t, c)
+    def forward(self, x, t, c):
+        t = self.time_embed(t)
+        c = self.cond_embed(c)
+        return self.unet(x, t, c)
 
 # model
-    if args.dataset == "Kanji":
+if args.dataset == "Kanji":
+    if args.use_label_clip_embedding:
+        print("use label clip embedding")
+        channel_num = 1
+        data_label_num = 512
+
+    else:
         channel_num = 1
         data_label_num = 1306
 
 
-    unet = Unet(in_channels=channel_num, embedding_channels=64).to(device)
-    time_embed = Time_Embed().to(device)
-    cond_embed = Cond_Embed(label_num=data_label_num).to(device)
-    model = CombinedModel(unet, time_embed, cond_embed).to(device)
+unet = My_Unet(in_channels=channel_num, embedding_channels=64).to(device)
+time_embed = Time_Embed().to(device)
+cond_embed = Cond_Embed(label_num=data_label_num).to(device)
+model = CombinedModel(unet, time_embed, cond_embed).to(device)
 
 # dataloader 
 if args.dataset == "Kanji":
-    batch_size = 16
+    batch_size = 32
     transform = transforms.Compose([
         transforms.Resize((64, 64)),  # 拡張して使うなら
         transforms.ToTensor(),
@@ -151,8 +131,9 @@ if args.dataset == "Kanji":
     
     dataset = KanjiDataLoader(
         data_dir="I:/Kanji_dataset/kanjivg-radical/kanji_image_data",
-        json_path="I:/Kanji_dataset/kanjivg-radical/data/final_dataset.json",
-        transform=transform
+        json_path="I:/Kanji_dataset/kanjivg-radical/data/clip_embeddings.json",
+        args=args,
+        transform=transform,
     )
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -278,27 +259,34 @@ for epoch in iterator:
     
     with torch.no_grad():
         model.eval()
-        
+        num_samples = 25 ## 適宜調整
+
+
         if args.optimizer == "RAdamScheduleFree":
             optimizer.eval()
         if args.dataset == "Kanji":
-            x_0 = torch.randn(25, 1, 32, 32).to(device)
-        time_embedded = time_embed(torch.linspace(0, 1, 10).unsqueeze(1).to(device))
-        num_samples = 25 ## 適宜調整
-        multi_hot_batch = torch.zeros((num_samples, data_label_num))
+            x_0 = torch.randn(num_samples, 1, 32, 32).to(device)
 
-        for i in range(num_samples):
-            num_active = random.randint(1, 5)  # 1〜3個の1を入れる
-            indices = random.sample(range(data_label_num), num_active)
-            multi_hot_batch[i, indices] = 1.0
-        multi_hot_batch = multi_hot_batch.to(torch.float32).to(device)
-        cond_embedded = cond_embed(multi_hot_batch)
+        time_embedded = time_embed(torch.linspace(0, 1, 10).unsqueeze(1).to(device))
+
+        if args.use_label_clip_embedding: # use pseudo clip embedding
+            test_labels = torch.randn(num_samples, data_label_num).to(device)
+            cond_embedded = cond_embed(test_labels)
+        else: # use one-hot
+            test_labels = torch.zeros((num_samples, data_label_num))
+
+            for i in range(num_samples):
+                num_active = random.randint(1, 5)  # 1〜3個の1を入れる
+                indices = random.sample(range(data_label_num), num_active)
+                test_labels[i, indices] = 1.0
+            test_labels = test_labels.to(torch.float32).to(device)
+            cond_embedded = cond_embed(test_labels)
 
         # cond_embedded = cond_embed(nn.functional.one_hot(torch.arange(data_label_num), data_label_num).float().cuda())
 
         if args.train_use_cfg:
             # uncond_labels = torch.zeros((cond_embedded.size(0), data_label_num), device=device)
-            uncond_labels = torch.zeros_like(multi_hot_batch, device=device)
+            uncond_labels = torch.zeros_like(test_labels, device=device)
             uncond_embedded = cond_embed(uncond_labels)
 
         for i in range(10): # timestep
@@ -334,8 +322,8 @@ for epoch in iterator:
 
     if epoch % 20 == 0 and epoch != 0:
         os.makedirs(f"result_{args.dataset}/models", exist_ok=True)
-        torch.save(model.state_dict(), f"result_{args.dataset}/models/flow_model_{epoch}_{args.dataset}_{args.sampler}.pth")
+        torch.save(model.state_dict(), f"result_{args.dataset}/models/flow_model_{epoch}_{args.dataset}_{args.sampler}_clip_{args.use_label_clip_embedding}.pth")
 
 
 os.makedirs(f"result_{args.dataset}/models", exist_ok=True)
-torch.save(model.state_dict(), f"result_{args.dataset}/models/flow_model_last_{args.dataset}_{args.sampler}.pth")
+torch.save(model.state_dict(), f"result_{args.dataset}/models/flow_model_last_{args.dataset}_{args.sampler}_clip_{args.use_label_clip_embedding}.pth")

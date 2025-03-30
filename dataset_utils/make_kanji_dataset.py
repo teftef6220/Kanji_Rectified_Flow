@@ -159,7 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-json", type=str, default="I:/Kanji_dataset/kanjivg-radical/data/final_dataset_test.json",
                       help="出力JSONファイルのパス")
     parser.add_argument("--no_skip_existing",default=False, action="store_true",
-                      help="既存のPNG画像がある場合でも上書きする")
+                      help="True の場合、既存のPNG画像がある場合でも上書きする")
     
     args = parser.parse_args()
     
